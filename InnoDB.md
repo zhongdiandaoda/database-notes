@@ -203,3 +203,190 @@ B+树的索引分为聚簇索引和辅助索引。
 
 `InnoDB`存储引擎表是索引组织表，表中数据按照主键顺序存放。聚簇索引就是按照每张表的主键构建一棵二叉树，同时，叶子节点存放的是整张表的行记录数据，也将聚簇索引的叶子节点称为数据叶，每个数据叶都通过一个双向链表进行链接。
 
+
+
+
+
+# 锁
+
+
+
+
+
+
+
+
+
+# 事务
+
+事务是数据库区分于文件系统的重要特性之一。事务会把数据库从一种一致状态转换为另一种一致状态。在数据库提交工作时，可以确保要么所有修改都已经保存了，要么所有修改都不保存。
+
+`InnoDB`存储引擎中的事务完全符合ACID的特性：
+
+- 原子性 atomicity
+- 一致性 consistency
+- 隔离性 isolation
+- 持久性 durability
+
+1 原子性
+
+原子性指整个数据库事务是不可分割的工作单位，只有使事务中所有的数据库操作都执行成功，才算整个事务成功。任意一条SQL语句执行失败，已经执行成功的SQL语句也必须撤销，数据库状态应该退回到执行事务前的状态。
+
+2 一致性
+
+一致性是指事务将数据库从一种一致的状态转变为下一种一致的状态。在事务开始之前和事务结束以后，数据库的完整性约束没有被破坏。例如，表中的一个字段姓名满足唯一性，如果一个事务对姓名进行了修改，但是在事务提交或者回滚后，表中的姓名变得不唯一了，这就破坏了事务的一致性要求。因此，事务是一致性的单位，如果事务中某个动作失败了，系统会撤销事务，恢复初始状态。
+
+3 隔离性
+
+事务的隔离性要求同一时间，只允许一个事务请求同一数据，不同的事务之间彼此没有任何干扰。
+
+4 持久性
+
+事务一旦提交，其结果就是永久性的，即使发生宕机等故障，数据库也能将数据恢复。持久性保障事务系统的高可靠性，但不保障高可用性，如RAID损坏等。
+
+## 事务的实现
+
+事务的隔离性由锁来实现，事务的原子性，一致性和持久性通过数据库的redo log和undo log来实现。
+
+### redo
+
+重做日志用来实现事务的持久性，其由两部分组成：一是内存中的重做日志缓冲（redo log buffer），是易失的；二是重做日志文件（redo log file），是持久的。
+
+`InnoDB`是事务的存储引擎，通过Force Log at Commit机制实现事物的持久性，即当事务提交时，必须先将事物的所有日志写入到重做日志文件中进行持久化。
+
+为了确保每次日志都写入redo log file，在每次将redo log buffer写入redo log file后，`InnoDB`存储引擎都会调用依次`fsync`操作，将文件系统缓存中的文件刷新到磁盘中，磁盘的性能决定了事务提交的性能。
+
+用户可以手动控制日志写入磁盘的策略，让数据库在事务提交时不强制将log刷新到磁盘，但这样做会破坏ACID特性。将`innodb_flush_log_at_trx_commit`为1时，每次提交事务都会将日志刷新到磁盘；为0时，表示事务提交后不强制写入到磁盘，而是由master线程每1秒进行依次日志文件的`fsync`操作；为2时，表示每次redo log写入文件系统的缓存，由操作系统决定缓存何时刷新到磁盘。
+
+在`InnoDB`中，重做日志都是以512字节进行存储的。若一个页中产生的重做日志大小大于512字节，则需要分割为多个redo log block进行存储。因为redo log block的大小与磁盘扇区一样，因此redo log的写入可以保证原子性。
+
+重做日志块的结构：
+
+![image-20210815145107748](InnoDB.assets/image-20210815145107748.png)
+
+
+
+### undo
+
+undo用来支持事务的回滚操作，存放在数据库内部的undo段中。undo segment位于共享表空间内。
+
+undo操作会将数据库逻辑的恢复到执行事务之前的状态，所有修改都被逻辑地取消了（防止物理将数据库恢复到先前的状态时影响到其他事务）。例如，对每个INSERT，执行一个DELETE；对每个UPDATE，执行一个相反的UPDATE。
+
+undo的了另一个作用时MVCC，当用户读取一行记录时，若该记录已被其他事务占用，当前事务可以通过undo读取之前的行版本信息，实现非锁定读取。
+
+
+
+## 事务控制语句
+
+
+
+## 隐式提交的SQL语句
+
+
+
+## 事务的隔离级别
+
+**1、READ UNCOMMITTED**
+
+在该隔离级别，所有事务都可以看到其他未提交事务的执行结果。
+
+本隔离级别很少用于实际应用，因为它的性能也不比其他级别好多少。读取未提交的数据，也被称之为脏读（Dirty Read）。
+
+**2、READ COMMITTED**
+
+这是大多数数据库系统的默认隔离级别（但不是MySQL默认的）。
+它满足了隔离的简单定义：一个事务只能看见已经提交事务所做的改变。
+这种隔离级别会导致不可重复读（`Nonrepeatable Read`）的问题，因为同一事务的其他实例在该实例处理期间可能会有新的commit，所以相同的 select 可能返回不同结果。
+
+**3、REPEATABLE READ**
+
+这是MySQL的默认事务隔离级别，一个事务读取数据后，会对数据加锁，其他事务无法进行UPDATE操作。
+不过理论上，这会导致另一个棘手的问题：幻读 （Phantom Read）。
+幻读指当用户读取某一范围的数据行时，另一个事务又在该范围内插入了新行，当用户再读取该范围的数据行时，会发现有新的“幻影” 行。由于其他事务的INSERT操作，当前事务会产生幻读现象。
+`InnoDB`和Falcon存储引擎通过多版本并发控制（MVCC，Multi Version Concurrency Control）机制解决了该问题。
+
+**4、SERIALIZABE**
+
+这是最高的隔离级别，它通过强制事务排序，使之不可能相互冲突，从而解决幻读问题。
+简言之，它是在每个读的数据行上加上共享锁。在这个级别，可能导致大量的超时现象和锁竞争。
+
+```sql
+[窗口A]:
+
+mysql> SET GLOBAL tx_isolation='SERIALIZABLE';
+Query OK, 0 rows affected (0.00 sec)
+
+mysql> quit;
+Bye
+
+[root@vagrant-centos65 ~]# mysql -uroot -pxxxx(重新登录)
+
+mysql> SELECT @@tx_isolation;
++----------------+
+| @@tx_isolation |
++----------------+
+| SERIALIZABLE   |
++----------------+
+1 row in set (0.00 sec)
+
+mysql> select * from test.user;
++----+------+
+| id | name |
++----+------+
+|  2 | b    |
+|  4 | d    |
++----+------+
+2 rows in set (0.00 sec)
+
+mysql> begin;
+Query OK, 0 rows affected (0.00 sec)
+
+mysql> insert into test.user values (5, 'e');
+Query OK, 1 row affected (0.00 sec)
+
+[窗口B]:
+
+mysql> quit;
+Bye
+
+[root@vagrant-centos65 ~]# mysql -uroot -pxxxx(重新登录)
+
+mysql> SELECT @@tx_isolation;
++----------------+
+| @@tx_isolation |
++----------------+
+| SERIALIZABLE   |
++----------------+
+1 row in set (0.00 sec)
+
+mysql> select * from test.user;
+ERROR 1205 (HY000): Lock wait timeout exceeded; try restarting transaction
+
+[窗口A]:
+
+mysql> commit;
+Query OK, 0 rows affected (0.01 sec)
+
+[窗口B]:
+
+mysql> mysql> select * from test.user;
++----+------+
+| id | name |
++----+------+
+|  2 | b    |
+|  4 | d    |
+|  5 | e    |
++----+------+
+3 rows in set (0.00 sec)
+```
+
+
+
+四种隔离级别的问题：
+
+| 隔离级别                        | 脏读（Dirty Read） | 不可重复读（NonRepeatable Read） | 幻读（Phantom Read） |
+| ------------------------------- | ------------------ | -------------------------------- | -------------------- |
+| 未提交读（Read uncommitted）    | 可能               | 可能                             | 可能                 |
+| 已提交读（Read committed）      | 不可能             | 可能                             | 可能                 |
+| **可重复读（Repeatable read）** | **不可**能         | **不可**能                       | **可能**             |
+| 可串行化（Serializable ）       | 不可能             | 不可能                           | 不可能               |
