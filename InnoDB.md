@@ -233,27 +233,164 @@ MySQL数据库中的参数可以分为两类：
 
 ## 日志文件
 
+### 错误日志
 
+错误日志文件对MySQL的启动、运行、关闭过程进行了记录。MySQL DBA在遇到问题时应该首先查看该文件来定位问题。
 
+可以通过以下命令来定位该文件：
 
+```shell
+mysql> show variables like 'log_error';
++---------------+------------------------------------------------+
+| Variable_name | Value                                          |
++---------------+------------------------------------------------+
+| log_error     | D:\MySQL\mysql-5.7.30\data\DESKTOP-LE1O5PF.err |
++---------------+------------------------------------------------+
+1 row in set, 1 warning (0.05 sec)
+```
 
+文件内容：
 
+![image-20210818150048617](InnoDB.assets/image-20210818150048617.png)
 
+### 慢查询日志
 
+默认情况下，MySQL数据库并不启动慢查询日志，需要用户手动开启。不需要调优时不建议开启该功能，会影响MySQL数据库的性能。
 
+```shell
+mysql> show variables like 'slow_query_log%';
++---------------------+-----------------------------------------------------+
+| Variable_name       | Value                                               |
++---------------------+-----------------------------------------------------+
+| slow_query_log      | OFF                                                 |
+| slow_query_log_file | D:\MySQL\mysql-5.7.30\data\DESKTOP-LE1O5PF-slow.log |
++---------------------+-----------------------------------------------------+
+2 rows in set, 1 warning (0.00 sec)
 
+#开启命令
+set global slow_query_log = 1;
+```
 
+通过long_query_time参数设置超过多少秒的查询视为慢查询，数据库会将这些查询语句记录在慢查询日志中。
 
+```shell
+mysql> SHOW VARIABLES LIKE 'long_query_time';
++-----------------+-----------+
+| Variable_name   | Value     |
++-----------------+-----------+
+| long_query_time | 10.000000 |
++-----------------+-----------+
+1 row in set, 1 warning (0.00 sec)
 
+#修改值
+set global long_query_time = 4;
+```
 
+可以通过`log_output`参数选择将日志存储到文件中或者MySQL的slow_log表中，默认是存储在文件中（存储在表中会耗费更多的系统资源）。
 
+```shell
+mysql> show variables like '%log_output%';
++---------------+-------+
+| Variable_name | Value |
++---------------+-------+
+| log_output    | FILE  |
++---------------+-------+
+1 row in set, 1 warning (0.00 sec)
+```
 
+**使用`mysql dumpslow`命令可以更方便的分析日志。**
 
+### 查询日志
 
+查询日志记录了所有对MySQL数据库请求的信息，无论这些请求是否得到了正确的执行。
 
+默认文件名为：主机名.log
 
+```shell
+mysql> show variables like '%general_log%';
++------------------+------------------------------------------------+
+| Variable_name    | Value                                          |
++------------------+------------------------------------------------+
+| general_log      | OFF                                            |
+| general_log_file | D:\MySQL\mysql-5.7.30\data\DESKTOP-LE1O5PF.log |
++------------------+------------------------------------------------+
+2 rows in set, 1 warning (0.00 sec)
+```
 
+默认也是关闭的，需要调优时可选择开启。
 
+### 二进制日志
+
+Binary Log记录了对MySQL数据库执行更改的所有操作，例如建表或UPDATE操作，同时，使用Statement-based logging时，一些可能对数据库产生更改但未产生更改的语句也会被记录（例如没有删除任何一行的DELETE语句）。
+
+二进制日志的作用：
+
+- 在主从集群中，Master节点会将二进制日志发送给Worker节点，Worker节点执行二进制日志的内容来与master节点保持一致。
+- 从一个备份恢复数据库时，在该备份的时间节点后的二进制日志中的操作会被执行。
+
+Binary Log不会记录SELECT和SHOW命令，需要记录所有操作时应使用查询日志general log。
+
+默认情况下bin log是二进制文件，无法直接查看，可以通过`mysqlbinlog`工具来查看。
+
+记录二进制日志有两种方式：
+
+1. Row-based logging：描述独立的一行记录被修改的细节。
+
+   缺点：由于所有的执行的语句在日志中都将以每行记录的修改细节来记录，因此，可能会产生大量的日志内容，干扰内容也较多；比如一条update语句，如修改多条记录，则bin log中每一条修改都会有记录，这样造成bin log日志量会很大，特别是当执行alter table之类的语句的时候，由于表结构修改，每条记录都发生改变，那么该表每一条记录都会记录到日志中，实际等于重建了表。
+
+2. Statement-based logging：记录导致数据改变的SQL语句。
+
+   缺点：为了保证SQL语句能在worker节点上正确执行，必须记录上下文信息，以保证所有语句能在worker得到和在master端执行时相同的结果；另外，主从复制时，存在部分函数（如sleep）及存储过程在worker上会出现与master结果不一致的情况，而相比Row level记录每一行的变化细节，绝不会发生这种不一致的情况
+
+**基于Bin Log的主从复制过程：**
+
+```
+a.Master将数据改变记录到二进制日志(binary log)中
+b.Worker上的IO进程连接Master，并请求从指定日志文件的指定位置（或者从最开始的日志）之后的日志内容
+c.Master接收到来自Worker的IO进程的请求后，负责复制的IO进程会根据请求信息读取日志指定位置之后的日志信息，返回给Worker的IO进程。
+  返回信息中除了日志所包含的信息之外，还包括本次传输中，Master端传输的最后的bin-log文件的名称以及bin-log的位置。
+d.Worker的IO进程接收到信息后，将接收到的日志内容依次添加到Worker端的relay-log文件的最末端，并将读取到的Master端的bin-log的文   件名和位置记录到master-info文件中，以便在下一次读取的时候能够告诉Master需要读取从某个bin-log的哪个位置开始往后的日志内容。
+e.Worker的Sql进程检测到relay-log中新增加了内容后，会马上解析relay-log的内容成为在Master端真实执行时候的那些可执行的内容，并在自身执行。
+```
+
+## 表结构定义文件
+
+MySQL数据的存储是根据表进行的，每个表都会有与之对应的文件，但无论采用哪种存储引擎，MySQL都有一个以`frm`为后缀名的文件，记录该表的表结构定义，
+
+`frm`文件还能存储视图的定义。
+
+## `InnoDB`存储引擎文件
+
+### 表空间文件
+
+`InnoDB`采用将存储的数据按表空间进行存放的设计。在默认情况下，会有一个初始大小为10MB，名为ibdata1的文件，是默认的表空间文件，用户可以通过参数`innodb_data_file_path`对其进行设置。
+
+用户可以将多个文件组合为一个表空间：
+
+```
+[mysqld]
+innodb_data_file_path = /db/ibdata1:2000M;/dr2/db/ibdata2:2000M:autoextend
+```
+
+此时，如果两个文件位于不同的磁盘，磁盘的负载可能被平均，因此能提高数据库的整体性能。
+
+没有设置`innodb_file_per_table`为ON时，所有基于`InnoDB`的表的数据都会被记录到共享的表空间文件中。
+
+当设置了参数`innodb_file_per_table`时，每个基于`InnoDB`存储引擎的表将被存储到一个独立的表空间中，命名为`表名.idb`。需要注意的是，这些单独的表空间文件仅存储该表的数据、索引和插入缓冲BITMAP等信息，，其余信息还是存在默认的表空间中。
+
+默认开启：
+
+```shell
+mysql> show variables like '%innodb_file_per_table%';
++-----------------------+-------+
+| Variable_name         | Value |
++-----------------------+-------+
+| innodb_file_per_table | ON    |
++-----------------------+-------+
+1 row in set, 1 warning (0.00 sec)
+```
+
+### 重做日志文件
 
 
 
