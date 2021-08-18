@@ -10,10 +10,6 @@
 
 MySQL实例在系统上的表现是一个进程。
 
-MySQL实例启动时，会在以下路径一次查找配置文件，后查找到的配置会覆盖先查找到的配置：
-
-`/etc/my.cnf		/etc/mysql/my.cnf		/usr/local/mysql/etc/my.cnf		~/.my.cnf`
-
 MySQL体系结构：
 
 ![img](InnoDB.assets/403167-20190116145915277-683033214.jpg)
@@ -47,7 +43,7 @@ InnoDB存储引擎有多个内存块，共同组成了一个大的内存池，�
 - 重做日志缓冲
 - ….
 
-<img src="InnoDB.assets/image-20210804170535952.png" alt="image-20210804170535952" style="zoom:80%;" />
+<img src="InnoDB.assets/image-20210817155712100.png" alt="image-20210817155712100" style="zoom:50%;" />
 
 后台线程的主要作用是负责刷新内存池中的数据，保证缓冲池中的内存缓存的是最新的数据，此外，将已修改的数据文件刷新到磁盘文件，同时保证在数据库发生异常时InnoDB能恢复到正常运行状态。
 
@@ -59,11 +55,11 @@ InnoDB存储引擎有多个内存块，共同组成了一个大的内存池，�
 
 2. IO Thread
 
-   InnoDB大量使用了AIO来处理写请求，IO Thread的工作主要是负责这些IO请求的回调，IO Thread包括read、write、insert buffer和log。
+   `InnoDB`大量使用了AIO来处理写请求，IO Thread的工作主要是负责这些IO请求的回调，IO Thread包括read、write、insert buffer和log。一般来说，包括4个read thread，4个write thread，1个insert buffer thread和1个log thread。
 
 3. Purge Thread
 
-   回收已经使用并分配的undo页，减轻Master Thread的压力。
+   事务提交后，其undo log可能不再需要，Purge Thread回收已经使用并分配的undo页，减轻Master Thread的压力。
 
 4. Page Cleaner Thread
 
@@ -77,36 +73,93 @@ InnoDB存储引擎有多个内存块，共同组成了一个大的内存池，�
 
    当修改缓冲池中页的数据时，首先将数据写入缓冲池，然后通过 Checkpoint 机制刷新回磁盘。
 
-   ![image-20210804172344245](InnoDB.assets/image-20210804172344245.png)
+   ![img](InnoDB.assets/InnoDB-Buffer-Pool.png)
+
+   查看缓冲池大小：
+
+   ```mysql
+   mysql> show variables like 'innodb_buffer_pool_size';
+   +-------------------------+-----------+
+   | Variable_name           | Value     |
+   +-------------------------+-----------+
+   | innodb_buffer_pool_size | 134217728 |
+   +-------------------------+-----------+
+   1 row in set, 1 warning (0.01 sec)
+   ```
+
+   从`InnoDB` 1.0.x开始，允许有多个缓冲池实例，每个页根据哈希值平均分配到不同的缓冲池实例中，减少数据库内部的资源竞争，增加数据库的并发处理能力。
+
+   查看缓冲池实例数：
+
+   ```mysql
+   mysql> show variables like 'innodb_buffer_pool_instances';
+   +------------------------------+-------+
+   | Variable_name                | Value |
+   +------------------------------+-------+
+   | innodb_buffer_pool_instances | 1     |
+   +------------------------------+-------+
+   1 row in set, 1 warning (0.00 sec)
+   ```
+
+   可以在配置文件中修改该值。
 
 2. LRU List，Free List 和 Flush List
 
-   InnoDB 引擎的缓冲池采用了优化的LRU算法进行管理，将新读取到的页放到LRU列表的midpoint位置。
+   `InnoDB` 引擎的缓冲池采用了优化的 LRU 算法进行管理，将新读取到的页放到 LRU 列表的 midpoint 位置。
+
+   ![img](InnoDB.assets/midpoint.png)
 
    传统LRU链表的问题：
 
    - 进行全表扫描时，可能会将访问频率很低的数据页装入缓存，扫描结束后导致命中率明显降低。
    - 触发MySQL的预读机制时，会将可能使用的其他页加载到内存，此时可能会淘汰访问比较频繁的数据页，降低命中率。
 
-   优化后，缓冲池中63%的空间用于存放热数据，37%的空间用于存放冷数据。
+   优化后，缓冲池中5/8的空间用于存放热数据，称为 young 区，3/8的空间用于存放冷数据，称为 old 区。
+
+   ```mysql
+   mysql> show variables like 'innodb_old_blocks_pct';
+   +-----------------------+-------+
+   | Variable_name         | Value |
+   +-----------------------+-------+
+   | innodb_old_blocks_pct | 37    |
+   +-----------------------+-------+
+   1 row in set, 1 warning (0.00 sec)
+   ```
+
+   ![Content is described in the surrounding text.](InnoDB.assets/innodb-buffer-pool-list.png)
+
+   当数据页第一次被加载到缓冲池时，会放到 old 区的首部，当这个数据页再次被访问到时，如果该页在old区存在的时间超过了1秒，就把它移动到 young 区的首部（这会导致young区和old区的其他数据页全部后移一位）。
 
    用户可以通过`innodb_old_blocks_time`参数控制数据页在冷数据区停留多久后转移到热数据区。
+
+   改进的LRU算法解决了之前提到的两个问题。
+
+   **针对全表扫描的问题：**
+
+   1. 扫描过程中，需要新插入的数据页，都放到old区
+   2. 一个数据页有多条记录，因此一个数据页会被访问多次
+   3. 由于是顺序扫描，因此一个页的连续的两次访问间隔时间会小于1s，不会转移到 young 区。
+   4. 该页扫描完后，不会再访问该页，因此该页很快就会被淘汰。
+
+   **针对预读机制：**预读到的页位于 old 区，如果它不是热点页，会很快被淘汰。
+
+   可以通过`show engine innnodb status\G`监控冷热数据，pages made young表示页从old 区转移到young区的数量，pages not made young表示在old区被淘汰的页个数。
 
    Free List 存放缓冲池中可以使用的页，LRU List 存放使用 LRU 算法管理的数据页。
 
    LRU List中的页被修改后，称该页为脏页，即缓冲池中的页和磁盘中的页的数据产生了不一致。这是数据库会通过CHECKPOINT机制将脏页刷新回磁盘，Flush List 中的页即为脏页列表（脏页同时存在于LRU List和Flush List）。
 
-3. Redo Log 缓冲
+3. Redo Log Buffer
 
-   InnoDB存储引擎首先把Redo Log 存入到该缓冲中，然后以一定频率将其刷新到Redo Log文件。
+   `InnoDB`存储引擎首先把Redo Log 存入到该缓冲中，然后以一定频率将其刷新到Redo Log文件。
 
-   - Master Thread 每个1s将Redo Log缓冲刷新到Redo Log文件。
+   - Master Thread 每隔1s将Redo Log缓冲刷新到Redo Log文件。
    - 每个事务提交时会将Redo Log缓冲刷新到Redo Log文件。
    - Redo Log缓冲剩余空间小于1/2时，会将Redo Log缓冲刷新到Redo Log文件。
 
 ## Checkpoint技术
 
-如果每次一个数据页发生变化，就立即将缓冲池中的页刷新到磁盘，那么开销将非常大。同时，如果在从缓冲池将页的新版本刷新到磁盘时发生了宕机，那么数据就不能恢复了。为了避免发生数据丢失的问题，当前基于事务的数据库系统都普遍采用了Write Ahead Log策略，即当事务提交时，先写redo log，再修改页。当由于发生宕机导致数据丢失时，通过重做日志来完成数据的恢复。
+如果每次一个数据页发生变化，就立即将缓冲池中的页刷新到磁盘，那么开销将非常大。同时，如果在从缓冲池将页的新版本刷新到磁盘时发生了宕机，那么数据就不能恢复了。为了避免发生数据丢失的问题，当前基于事务的数据库系统都普遍采用了 WAL(Write Ahead Log) 策略，即当事务提交时，先写redo log，再修改页。当由于发生宕机导致数据丢失时，通过重做日志来完成数据的恢复。
 
 checkpoint机制的目的是：
 
@@ -118,7 +171,7 @@ checkpoint机制的目的是：
 
 当LRU算法淘汰的页是脏页时，需要强制执行checkpoint，将脏页刷新回磁盘。
 
-InnoDB的checkpoint包括Sharp Checkpoint和Fuzzy Checkpoint。
+`InnoDB`的checkpoint包括Sharp Checkpoint和Fuzzy Checkpoint。
 
 Sharp Checkpoint发生在数据库关闭时将所有的脏页都刷新回磁盘。
 
@@ -126,8 +179,10 @@ Fuzzy Checkpoint包括：
 
 - Master Thread Checkpoint：每隔一段时间异步刷新一定比例的页回磁盘。
 - FLUSH_LRU_LIST checkpoint：保证LRU列表中有一定数量的空闲页可用（Page Cleaner Thread）。
-- Async/Sync Flush Checkpoint：Redo Log不可用时，刷新一定数量的脏页回磁盘（Purge Thread）。
+- `Async/Sync Flush Checkpoint`：Redo Log不可用时，刷新一定数量的脏页回磁盘（Purge Thread）。
 - Dirty Page too much checkpoint：脏页占缓冲池比例过高时，强制执行checkpoint。
+
+
 
 ## Master Thread工作方式
 
@@ -135,23 +190,48 @@ Fuzzy Checkpoint包括：
 
 
 
-## InnoDB关键特性
+## `InnoDB`关键特性
 
 ### 插入缓冲
 
 
 
+### 两次写
+
+
+
+### 自适应哈希索引
+
+
+
+### 异步IO
+
+
+
+### 刷新邻接页
 
 
 
 
 
+# 文件
 
+## 参数文件
 
+MySQL实例启动时，会在以下路径一次查找配置文件，后查找到的配置会覆盖先查找到的配置：
 
+`/etc/my.cnf		/etc/mysql/my.cnf		/usr/local/mysql/etc/my.cnf		~/.my.cnf`
 
+MySQL数据库中的参数可以分为两类：
 
+- 动态参数
+- 静态参数
 
+动态参数意味着可以在MySQL实例运行中进行更改，静态参数说明在整个实例生命周期内都不得进行修改。
+
+对参数的修改可以设置为对当前会话有效或修改变量的全局值，对当前实例生命周期内的所有会话都生效。
+
+## 日志文件
 
 
 
@@ -254,9 +334,11 @@ B+树的索引分为聚簇索引和辅助索引。
 
 `InnoDB`是事务的存储引擎，通过Force Log at Commit机制实现事物的持久性，即当事务提交时，必须先将事物的所有日志写入到重做日志文件中进行持久化。
 
-为了确保每次日志都写入redo log file，在每次将redo log buffer写入redo log file后，`InnoDB`存储引擎都会调用依次`fsync`操作，将文件系统缓存中的文件刷新到磁盘中，磁盘的性能决定了事务提交的性能。
+为了确保每次日志都写入redo log file，在每次将redo log buffer写入redo log file后，`InnoDB`存储引擎都会调用一次`fsync`操作，将缓存池中的文件刷新到磁盘中，磁盘的性能决定了事务提交的性能。
 
-用户可以手动控制日志写入磁盘的策略，让数据库在事务提交时不强制将log刷新到磁盘，但这样做会破坏ACID特性。将`innodb_flush_log_at_trx_commit`为1时，每次提交事务都会将日志刷新到磁盘；为0时，表示事务提交后不强制写入到磁盘，而是由master线程每1秒进行依次日志文件的`fsync`操作；为2时，表示每次redo log写入文件系统的缓存，由操作系统决定缓存何时刷新到磁盘。
+用户可以手动控制日志写入磁盘的策略，让数据库在事务提交时不强制将log刷新到磁盘，但这样做会破坏ACID特性。将`innodb_flush_log_at_trx_commit`设置为1时，每次提交事务都会将日志刷新到磁盘；为0时，表示由master线程每1秒进行一次日志文件的`fsync`操作；为2时，表示每次redo log buffer有一半的空间被使用时再持久化到磁盘。
+
+**某个事务未提交时，其redo log buffer也可能持久化到redo log文件中。**
 
 在`InnoDB`中，重做日志都是以512字节进行存储的。若一个页中产生的重做日志大小大于512字节，则需要分割为多个redo log block进行存储。因为redo log block的大小与磁盘扇区一样，因此redo log的写入可以保证原子性。
 
