@@ -504,6 +504,422 @@ create table a {
 
 ## `InnoDB`行记录格式
 
+表的行记录格式决定它的列是怎样在物理上存储的，同一个物理页中的行越多，索引和查询的效率就越高。
+
+`InnoDB`支持四种行记录格式：
+
+![image-20211009143855864](InnoDB.assets/image-20211009143855864.png)
+
+行记录最大长度：
+
+1. 页大小（page size）为4KB、8KB、16KB和32KB时，行记录最大长度（maximum row length）应该略小于页大小的一半。
+2. 默认页大小为16KB，因此行记录最大长度应该略小于8KB ，因此一个B+Tree叶子节点最少有2个行记录。
+
+
+
+### 变长列
+
+在`InnoDB`中，变长列（`variable-length column`）可能是以下几种情况
+
+1. 长度不固定的数据类型，例如`VARCHAR`、`VARBINARY`、`BLOB`、`TEXT`等。
+2. 对于长度固定的数据类型，如`CHAR`，如果实际存储占用的空间大于768Byte，`InnoDB`会将其视为变长列。
+3. 变长编码下的`CHAR`
+
+### 行溢出
+
+1. 当行记录的长度没有超过行记录最大长度时，所有数据都会存储在当前页
+2. 当行记录的长度超过`行记录最大长度`时，变长列（`variable-length column`）会选择外部溢出页（`overflow page`，一般是`Uncompressed BLOB Page`）进行存储
+   - `Compact` + `Redundant`：保留前768 Byte 在当前页（`B+Tree叶子节点`），其余数据存放在`溢出页`。`768Byte`后面跟着`20Byte`的数据，用来存储`指向溢出页的指针`
+   - `Dynamic` + `Compressed`：仅存储20 Byte 数据，存储`指向溢出页的指针`，这时比`Compact`和`Redundant`更高效，因为一个`B+Tree叶子节点`能`存放更多的行记录`
+
+[![img](InnoDB.assets/overflow.png)](https://innodb-1253868755.cos.ap-guangzhou.myqcloud.com/overflow.png)
+
+### Redundant 行记录格式
+
+Redundant 行记录格式兼容 5.0 版本之前的页格式。
+
+![img](InnoDB.assets/redundant_format.png)
+
+字段偏移列表：
+
+1. 按照列的顺序逆序放置
+2. 列长度小于255Byte，用`1Byte`存储
+3. 列长度大于255Byte，用`2Byte`存储
+
+记录头信息：
+
+| 名称                | 大小（bit） | 描述                                   |
+| :------------------ | :---------- | :------------------------------------- |
+| ()                  | 1           | 未知                                   |
+| ()                  | 1           | 未知                                   |
+| deleted_flag        | 1           | 该行是否已被删除                       |
+| min_rec_flag        | 1           | 如果该行记录是预定义为最小的记录，为1  |
+| **n_owned**         | 4           | 该记录拥有的记录数，用于`Slot`         |
+| heap_no             | 13          | 索引堆中该条记录的索引号               |
+| **n_fields**        | 10          | 记录中`列的数量`，一行最多支持`1023`列 |
+| **1byte_offs_flag** | 1           | 偏移列表的单位为`1Byte`还是`2Byte`     |
+| next_record         | 16          | 页中下一条记录的相对位置               |
+| Total               | `48(6Byte)` | nothing                                |
+
+隐藏列：
+
+1. ROWID：没有显式定义主键`或`唯一非NULL的索引时，`InnoDB`会自动创建6 Byte 的 ROWID
+2. Transaction ID：事务ID
+3. Roll Pointer：回滚指针
+
+实例：
+
+```shell
+mysql> CREATE TABLE t (
+    -> a VARCHAR(9000)
+    -> ) ENGINE=INNODB CHARSET=LATIN1 ROW_FORMAT=REDUNDANT;
+Query OK, 0 rows affected (0.08 sec)
+
+mysql> INSERT INTO t SELECT REPEAT('a',9000);
+Query OK, 1 row affected (0.05 sec)
+Records: 1  Duplicates: 0  Warnings: 0
+
+$ sudo python py_innodb_page_info.py -v /var/lib/mysql/test/t.ibd
+page offset 00000000, page type <File Space Header>
+page offset 00000001, page type <Insert Buffer Bitmap>
+page offset 00000002, page type <File Segment inode>
+page offset 00000003, page type <B-tree Node>, page level <0000>
+page offset 00000004, page type <Uncompressed BLOB Page>
+page offset 00000000, page type <Freshly Allocated Page>
+Total number of page: 6:
+Insert Buffer Bitmap: 1
+Freshly Allocated Page: 1
+File Segment inode: 1
+B-tree Node: 1
+File Space Header: 1
+Uncompressed BLOB Page: 1
+```
+
+16 进制信息：
+
+```shell
+# Vim,:%!xxd
+# page offset=3
+0000c000: 17e8 3157 0000 0003 ffff ffff ffff ffff  ..1W............
+0000c010: 0000 0000 408f 6113 45bf 0000 0000 0000  ....@.a.E.......
+0000c020: 0000 0000 0113 0002 03b2 0003 0000 0000  ................
+0000c030: 008b 0005 0000 0001 0000 0000 0000 0000  ................
+0000c040: 0000 0000 0000 0000 0157 0000 0113 0000  .........W......
+0000c050: 0002 00f2 0000 0113 0000 0002 0032 0801  .............2..
+0000c060: 0000 0300 8b69 6e66 696d 756d 0009 0200  .....infimum....
+0000c070: 0803 0000 7375 7072 656d 756d 0043 2700  ....supremum.C'.
+0000c080: 1300 0c00 0600 0010 0800 7400 0000 14b2  ..........t.....
+0000c090: 0300 0000 1408 cea3 0000 01f9 0110 6161  ..............aa
+0000c0a0: 6161 6161 6161 6161 6161 6161 6161 6161  aaaaaaaaaaaaaaaa
+......
+0000c390: 6161 6161 6161 6161 6161 6161 6161 0000  aaaaaaaaaaaaaa..
+0000c3a0: 0113 0000 0004 0000 0026 0000 0000 0000  .........&......
+0000c3b0: 2028 0000 0000 0000 0000 0000 0000 0000   (..............
+......
+
+# page offset=4
+00010000: 273a f701 0000 0004 0000 0000 0000 0000  ':..............
+00010010: 0000 0000 408f 6113 000a 0000 0000 0000  ....@.a.........
+00010020: 0000 0000 0113 0000 2028 ffff ffff 6161  ........ (....aa
+00010030: 6161 6161 6161 6161 6161 6161 6161 6161  aaaaaaaaaaaaaaaa
+......
+00012050: 6161 6161 6161 0000 0000 0000 0000 0000  aaaaaa..........
+00012060: 0000 0000 0000 0000 0000 0000 0000 0000  ................
+......
+```
+
+- 长度偏移列表（`4327 0013 000c 0006`）
+  总共有`4`列，`a`列的长度超过了`255Byte`，偏移列表的单位为`2Byte`，所以`0xc07d~0xc084`为长度偏移列表
+
+| 列序号 | 长度                   | 描述                   |
+| :----- | :--------------------- | :--------------------- |
+| 1      | `6` = 0x0006           | ROWID，隐藏列          |
+| 2      | `6` = 0x000c-0x0006    | Transaction ID，隐藏列 |
+| 3      | `7` = 0x0013-0x000c    | Roll Pointer，隐藏列   |
+| 4      | `9000`(0x4327暂不理解) | a VARCHAR(9000)        |
+
+- 记录头信息（`00 00 10 08 00 74`）
+
+| 名称            | 值   | 描述                    |
+| :-------------- | :--- | :---------------------- |
+| n_fields        | 4    | 记录中列的数量          |
+| 1byte_offs_flag | 0    | 偏移列表的单位为`2Byte` |
+
+- ROWID（`00 00 00 14 b2 03`）
+- Transaction ID（`00 00 00 14 08 ce`）
+- Roll Pointer（`a3 00 00 01 f9 01 10`）
+- a
+  - `page offset=3`，前768Byte（`0xc09e~0xc39d`），在溢出页的长度为`0x2028`，即`8232`
+  - `page offset=4`为`溢出页`，存放后8232Byte的数据(`0x1002e~0x12055`)
+
+### Compact 行记录格式
+
+Compact 行记录格式是在 MySQL 5.0 中引入的，其设计目标是高效的存储数据。
+
+对比 Redundant：
+
+- 减少了大约 20% 空间
+- 在某些操作下会增加 CPU 的占用
+- 在典型的应用场景下，比 Redundant 块
+
+Compact 行记录的存储方式：
+
+| 变长字段长度列表 | NULL标志位 | 记录头信息 | 列1数据 | 列2数据 | ……   |
+| ---------------- | ---------- | ---------- | ------- | ------- | ---- |
+
+变长字段长度列表是按照列的顺序逆序放置的，其长度为：
+
+- 若列的长度小于 255 字节，用 1 字节表示。
+- 若列的长度大于 255 字节，用 2 字节表示。
+
+变长字段的长度最大不能超过 2 字节，MySQL 数据库中 VARCHAR 的最大长度限制为 65535 。
+
+NULL 标志位记录该行数据中是否有 NULL 值，是一个位向量，可为 NULL 的列数量为 N ，则该标志位占用的字节数为`CEILING(N/8)` BYTE，列为 NULL 时不占用实际空间。
+
+记录头信息固定占用5字节，含义为：
+
+| 名称         | 大小 | 描述                                                         |
+| ------------ | ---- | ------------------------------------------------------------ |
+| ()           | 1    | 未知                                                         |
+| ()           | 1    | 未知                                                         |
+| deleted_flag | 1    | 该行是否被删除                                               |
+| min_rec_flag | 1    | 为1，如果该记录是预先被定义好的最小的记录                    |
+| n_owned      | 4    | 该记录拥有的记录数                                           |
+| heap_no      | 13   | 索引堆中该条记录的排序记录                                   |
+| record_type  | 3    | 000表示普通，001表示 B+ 树节点指针，010表示 infimum，<br>011表示 supremum，1xx保留 |
+| next_record  | 16   | 页中下一条记录的相对位置                                     |
+| total        | 40   |                                                              |
+
+**实例：**
+
+```mysql
+mysql> CREATE TABLE t (
+    -> a VARCHAR(10),
+    -> b VARCHAR(10),
+    -> c CHAR(10),
+    -> d VARCHAR(10)
+    -> ) ENGINE=INNODB CHARSET=LATIN1 ROW_FORMAT=COMPACT;
+Query OK, 0 rows affected (0.03 sec)
+
+mysql> INSERT INTO t VALUES ('1','22','22','333'),('4',NULL,NULL,'555');                                                               Query OK, 2 rows affected (0.02 sec)
+Records: 2  Duplicates: 0  Warnings: 0
+
+$ sudo python py_innodb_page_info.py -v /var/lib/mysql/test/t.ibd
+page offset 00000000, page type <File Space Header>
+page offset 00000001, page type <Insert Buffer Bitmap>
+page offset 00000002, page type <File Segment inode>
+page offset 00000003, page type <B-tree Node>, page level <0000>
+page offset 00000000, page type <Freshly Allocated Page>
+page offset 00000000, page type <Freshly Allocated Page>
+Total number of page: 6:
+Freshly Allocated Page: 2
+Insert Buffer Bitmap: 1
+File Space Header: 1
+B-tree Node: 1
+File Segment inode: 1
+```
+
+十六进制信息：
+
+```shell
+# Vim,:%!xxd
+# page offset=3
+0000c000: 1f96 f8df 0000 0003 ffff ffff ffff ffff  ................
+0000c010: 0000 0000 408f deaa 45bf 0000 0000 0000  ....@...E.......
+0000c020: 0000 0000 0116 0002 00c3 8004 0000 0000  ................
+0000c030: 00ac 0002 0001 0002 0000 0000 0000 0000  ................
+0000c040: 0000 0000 0000 0000 015a 0000 0116 0000  .........Z......
+0000c050: 0002 00f2 0000 0116 0000 0002 0032 0100  .............2..
+0000c060: 0200 1e69 6e66 696d 756d 0003 000b 0000  ...infimum......
+0000c070: 7375 7072 656d 756d 0302 0100 0000 1000  supremum........
+0000c080: 2b00 0000 14b2 0a00 0000 1409 03c6 0000  +...............
+0000c090: 020a 0110 3132 3232 3220 2020 2020 2020  ....12222
+0000c0a0: 2033 3333 0301 0600 0018 ffc4 0000 0014   333............
+0000c0b0: b20b 0000 0014 0903 c600 0002 0a01 1f34  ...............4
+0000c0c0: 3535 3500 0000 0000 0000 0000 0000 0000  555.............
+
+
+第1行记录（0xc078）
+变长字段长度列表（03 02 01）
+列a长度为1,列b长度为2,列c在LATIN1单字节编码下，长度固定，因此不会出现在该列表中,列d长度为3
+NULL标志位（00）
+在表中可以为NULL的可变列为a、b、d，0< 3/8 < 1，所以NULL标志位占用1Byte
+00表示没有字段为NULL
+记录头信息（00 00 10 00 2b）
+本行记录结束的位置0xc078+0x2b=c0a3
+ROWID（00 00 00 14 b2 0a）
+Transaction ID（00 00 00 14 09 03）
+Roll Pointer（c6 00 00 02 0a 01 10）
+a（31）
+字符1，VARCHAR(10)，1个字符只占用了1Byte
+b（32 32）
+字符22，VARCHAR(10)，2个字符只占用了2Byte
+c（32 32 20 20 20 20 20 20 20 20）
+字符22，CHAR(10)，2个字符依旧占用了10Byte
+d（33 33 33）
+字符333，VARCHAR(10)，3个字符只占用了3Byte
+
+第2行记录（0xc0a4）
+变长字段长度列表（03 01）
+列a长度为1,列b、c为NULL，不占用空间，因此不会出现在该列表中，NULL标志位会标识那一列为NULL,列d长度为3
+NULL标志位（06）
+0000 0110，表示列b和列c为NULL
+记录头信息（00 00 18 ff c4）
+ROWID（00 00 00 14 b2 0b）
+Transaction ID（00 00 00 14 09 03）
+跟第1行记录在同一个事务内
+Roll Pointer（c6 00 00 02 0a 01 1f）
+a（34）
+字符1，VARCHAR(10)，1个字符只占用了1Byte
+b
+VARCHAR(10)为NULL时，不占用空间
+c
+CHAR(10)为NULL时，不占用空间
+d（35 35 35）
+字符555，VARCHAR(10)，3个字符只占用了3Byte
+```
+
+
+
+### Compressed与Dynamic行记录格式
+
+`InnoDB` Plugin引入了新的文件格式（file format，可以理解为新的页格式），对于以前支持的Compact和Redundant格式将其称为Antelope文件格式，新的文件格式称为Barracuda。Barracuda文件格式下拥有两种新的行记录格式Compressed和Dynamic两种。新的两种格式对于存放BLOB的数据采用了完全的行溢出的方式，在数据页中只存放20个字节的指针，实际的数据都存放在BLOB Page中，而之前的Compact和Redundant两种格式会存放768个前缀字节。
+
+下图是Barracuda文件格式的溢出行：
+
+![img](InnoDB.assets/990532-20170116140227130-2129734898.png)
+
+Compressed行记录格式的另一个功能就是，存储在其中的行数据会以zlib的算法进行压缩，因此对于BLOB、TEXT、VARCHAR这类大长度类型的数据能进行非常有效的存储。
+
+实例：
+
+```mysql
+mysql> CREATE TABLE t (
+    -> a VARCHAR(9000)
+    -> ) ENGINE=INNODB CHARSET=LATIN1 ROW_FORMAT=DYNAMIC;
+Query OK, 0 rows affected (0.01 sec)
+
+mysql> INSERT INTO t SELECT REPEAT('a',9000);                                                                                          Query OK, 1 row affected (0.02 sec)
+Records: 1  Duplicates: 0  Warnings: 0
+
+$ sudo python py_innodb_page_info.py -v /var/lib/mysql/test/t.ibd
+page offset 00000000, page type <File Space Header>
+page offset 00000001, page type <Insert Buffer Bitmap>
+page offset 00000002, page type <File Segment inode>
+page offset 00000003, page type <B-tree Node>, page level <0000>
+page offset 00000004, page type <Uncompressed BLOB Page>
+page offset 00000000, page type <Freshly Allocated Page>
+Total number of page: 6:
+Insert Buffer Bitmap: 1
+Freshly Allocated Page: 1
+File Segment inode: 1
+B-tree Node: 1
+File Space Header: 1
+Uncompressed BLOB Page: 1
+```
+
+16 进制信息：
+
+```shell
+# Vim,:%!xxd
+# page offset=3
+0000c000: 0006 f2d2 0000 0003 ffff ffff ffff ffff  ................
+0000c010: 0000 0000 4090 bbcb 45bf 0000 0000 0000  ....@...E.......
+0000c020: 0000 0000 011a 0002 00a7 8003 0000 0000  ................
+0000c030: 0080 0005 0000 0001 0000 0000 0000 0000  ................
+0000c040: 0000 0000 0000 0000 015e 0000 011a 0000  .........^......
+0000c050: 0002 00f2 0000 011a 0000 0002 0032 0100  .............2..
+0000c060: 0200 1d69 6e66 696d 756d 0002 000b 0000  ...infimum......
+0000c070: 7375 7072 656d 756d 14c0 0000 0010 fff0  supremum........
+0000c080: 0000 0014 b211 0000 0014 093d ee00 0001  ...........=....
+0000c090: c201 1000 0001 1a00 0000 0400 0000 2600  ..............&.
+0000c0a0: 0000 0000 0023 2800 0000 0000 0000 0000  .....#(.........
+......
+
+# page offset=4
+00010000: 2371 f7ac 0000 0004 0000 0000 0000 0000  #q..............
+00010010: 0000 0000 4090 bbcb 000a 0000 0000 0000  ....@...........
+00010020: 0000 0000 011a 0000 2328 ffff ffff 6161  ........#(....aa
+00010030: 6161 6161 6161 6161 6161 6161 6161 6161  aaaaaaaaaaaaaaaa
+......
+00012340: 6161 6161 6161 6161 6161 6161 6161 6161  aaaaaaaaaaaaaaaa
+00012350: 6161 6161 6161 0000 0000 0000 0000 0000  aaaaaa..........
+
+```
+
+
+
+1. `page offset=3`中没有前缀的`768Byte`，`Roll Pointer`后直接跟着`20Byte`的指针
+2. `page offset=4`为`溢出页`，存储实际的数据，范围为`0x1002d~0x12355`，总共`9000`，即完全溢出
+
+### UTF8与CHAR
+
+1. `Latin1`与`UTF8`代表了两种编码类型，分别是定长编码和变长编码。
+2. `UTF8`对`CHAR(N)`的的处理方式在`Redundant`和`Compact`（或Dynamic、Compressed）中是不一样的：
+   - `Redundant`中占用`N * Maximum_Character_Byte_Length`
+   - `Compact`中`最小化`占用空间
+3. CHAR(N) 中的 N 实际代表的是字符的数量，而不是字节的数量，因此对于`'ab'`，其占用1个字节，`‘我们’`占用 2 个字节，但均是 CHAR(2) 类型。
+
+## `InnoDB`数据页格式
+
+**页结构：**
+
+![img](InnoDB.assets/959658-20200218143934785-1152604727.png)
+
+![img](InnoDB.assets/964149611_1582694852322_DF4BAE61C1D7C81A19ADF6826AD35DDF.png)
+
+| 名称               | 中文名                     | 占用空间 | 简单描述                 |
+| ------------------ | -------------------------- | -------- | ------------------------ |
+| File Header        | 文件头部                   | 38字节   | 页的一些头信息           |
+| Page Header        | 页面头部                   | 56字节   | 数据页的状态信息         |
+| Infimum + Supremum | 逻辑上的最小记录和最大记录 | 26字节   | 两个虚拟的行记录         |
+| User Records       | 用户记录                   | 不确定   | 实际存储的行记录内容     |
+| Free Space         | 空闲空间                   | 不确定   | 页中尚未使用的空间       |
+| Page Directory     | 页面目录                   | 不确定   | 页中的某些记录的相对位置 |
+| File Trailer       | 文件尾部                   | 8字节    | 校验页是否完整           |
+
+- **各个数据页**之间可以组成一个**双向链表**（就是B+树的各个页之间都按照索引值顺序用双向链表连接起来）
+- 而**每个数据页中的记录**又可以组成一个**单向**链表
+- 每个数据页都会为存储在它里边的记录生成一个**页目录**，该目录页是用**数组**进行管理，在通过**主键**查找某条记录的时候可以在页目录中使用**二分法快速定位**到对应的槽，然后再遍历该槽对应分组中的记录即可快速找到指定的记录
+- 以**其他列**(非主键)作为搜索条件：只能从最小记录开始**依次遍历单链表中的每条记录**。
+
+示意图：
+
+![img](InnoDB.assets/964149611_1582694852901_DF4BAE61C1D7C81A19ADF6826AD35DDF.png)
+
+### 插入记录
+
+核心入口函数在`page_cur_insert_rec_low`。核心步骤如下:
+
+1. 获取记录的长度。函数传入参数就有已经组合好的完整记录，所以只需要从记录的元数据中获取即可。
+2. 首先从`PAGE_FREE`链表中尝试获取足够的空间。仅仅比较链表头的一个记录，如果这个记录的空间大于需要插入的记录的空间，则复用这块空间(包括heap_no)，否则就从`PAGE_HEAP_TOP`分配空间。如果这两个地方都没有，则返回空。这里注意一下，由于只判断Free链表的第一个头元素，所以算法对空间的利用率不是很高，估计也是为了操作方便。假设，某个数据页首先删除了几条大的记录，但是最后一条删除的是比较小的记录A，那么后续插入的记录大小只有比记录A还小，才能把Free链表利用起来。举个例子，假设先后删除记录的大小为4K, 3K, 5K, 2K，那么只有当插入的记录小于2K时候，这些被删除的空间才会被利用起来，假设新插入的记录是0.5K，那么Free链表头的2K，可以被重用，但是只是用了前面的0.5K，剩下的1.5K依然会被浪费，下次插入只能利用5K记录所占的空间，并不会把剩下的1.5K也利用起来。这些特性，从底层解释了，为什么InnoDB那么容易产生碎片，经常需要进行空间整理。
+3. 如果Free链表不够，就从`PAGE_HEAP_TOP`分配，如果分配成功，需要递增`PAGE_N_HEAP`。
+4. 如果这个数据页有足够的空间，则拷贝记录到指定的空间。
+5. 修改新插入记录前驱上的next指针，同时修改这条新插入记录的指针next指针。这两步主要是保证记录上链表的连续性。
+6. 递增`PAGE_N_RECS`。设置heap_no。设置owned值为0。
+7. 更新`PAGE_LAST_INSERT`，`PAGE_DIRECTION`，`PAGE_N_DIRECTION`，设置这些参数后，可以一定程度上提高连续插入的性能，因为插入前需要先定位插入的位置，有了这些信息可以加快查找。详见查找记录代码分析。
+8. 修改数据目录。因为增加了一条新的记录，可能有些目录own的记录数量超过了最大值(目前是8条)，需要重新整理一下这个数据页的目录(`page_dir_split_slot`)。算法比较简单，就是找到中间节点，然后用这个中间节点重新构建一个新的目录，为了给这个新的目录腾空间，需要把后续的所有目录都平移，这个涉及一次momove操作(`page_dir_split_slot`和`page_dir_add_slot`)。
+9. 写redolog日志，持久化操作。
+10. 如果有blob字段，则处理独立的off-page。
+
+
+
+### 查找记录/定位位置
+
+B+树索引本身不能找到具体的一条记录，只能找到数据所在的页，然后将页加载到内存中，根据页中的 Page Directory 在进行二分查找。
+
+在`InnoDB`中，需要查找某条件记录，需要调用函数page_cur_search_with_match，但如果需要定位某个位置，例如大于某条记录的第一条记录，也需要使用同一个函数。定位的位置有PAGE_CUR_G，PAGE_CUR_GE，PAGE_CUR_L，PAGE_CUR_LE四种，分别表示大于，大于等于，小于，小于等于四种位置。 由于数据页目录的存在，查找和定位就相对简单，先用二分查找，定位周边的两个目录，然后再用线性查找的方式定位最终的记录或者位置。 
+
+此外，由于每次插入前，都需要调用这个函数确定插入位置，为了提高效率，`InnoDB`针对按照主键顺序插入的场景做了一个小小的优化。因为如果按照主键顺序插入的话，能保证每次都插入在这个数据页的最后，所以只需要直接把位置直接定位在数据页的最后(`PAGE_LAST_INSERT`)就可以了。至于怎么判断当前是否按照主键顺序插入，就依赖`PAGE_N_DIRECTION`，`PAGE_LAST_INSERT`，`PAGE_DIRECTION`这几个信息了，目前的代码中要求满足5个条件：
+
+1. 当前的数据页是叶子节点
+2. 位置查询模式为PAGE_CUR_LE
+3. 相同方向的插入已经大于3了(`page_header_get_field(page, PAGE_N_DIRECTION) > 3`)
+4. 最后插入的记录的偏移量为空(`page_header_get_ptr(page, PAGE_LAST_INSERT) != 0`)
+5. 从右边插入的(`page_header_get_field(page, PAGE_DIRECTION) == PAGE_RIGHT`)
+
+## 分区表
+
 
 
 # 索引
