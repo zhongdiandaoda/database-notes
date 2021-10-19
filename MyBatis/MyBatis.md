@@ -703,7 +703,11 @@ StatementHandler 组件使用 JDBC 中的 Statement 对象与数据库完成交�
 
 源码分析：[抛开 Spring ，你知道 MyBatis 加载 Mapper 的底层原理吗？ - 不送花的程序猿 - 博客园 (cnblogs.com)](https://www.cnblogs.com/Howinfun/p/12973902.html)
 
+# SQL与Mapper接口的绑定关系是如何建立的？
 
+在MyBatis初始化阶段，当解析一个xml配置文件时，会尝试根据`<mapper namespace="....">`中的namespace属性值，判断classpath下有没有这样一个接口的全路径与namespace属性值完全相同，如果有，则建立二者之间的映射关系，否则，抛出`ClassNotFound`异常。
+
+建立映射关系后，会调用 **Configuration** 的 addMapper方法，随后向 MapperRegistry 注册该 Mapper，MapperRegistry 会为该 Mapper 生成一个动态代理工厂类，随后调用 getMapper 方法时，会从工厂类中获取一个动态代理对象。
 
 
 
