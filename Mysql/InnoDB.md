@@ -352,32 +352,52 @@ mysql> show variables like '%general_log%';
 
 ### 二进制日志
 
-Binary Log记录了对MySQL数据库执行更改的所有操作，例如建表或UPDATE操作，同时，使用Statement-based logging时，一些可能对数据库产生更改但未产生更改的语句也会被记录（例如没有删除任何一行的DELETE语句）。
+Binary Log 记录了对 MySQL 数据库执行更改的所有操作，例如建表或 UPDATE 操作，同时，使用 Statement-based logging 时，一些可能对数据库产生更改但未产生更改的语句也会被记录（例如没有删除任何一行的DELETE语句）。
 
 二进制日志的作用：
 
-- 在主从集群中，Master节点会将二进制日志发送给Worker节点，Worker节点执行二进制日志的内容来与master节点保持一致。
+- 在主从集群中，Master 节点会将二进制日志发送给 Worker 节点，Worker 节点执行二进制日志的内容来与 master 节点保持一致。
 - 从一个备份恢复数据库时，在该备份的时间节点后的二进制日志中的操作会被执行。
 
-Binary Log不会记录SELECT和SHOW命令，需要记录所有操作时应使用查询日志general log。**bin log只在事务提交完成后，但还没释放锁前进行一次写入。**
+Binary Log 不会记录 SELECT 和 SHOW 命令，需要记录所有操作时应使用查询日志 general log。**bin log 只在事务提交完成后，但还没释放锁前进行一次写入。**
 
-默认情况下bin log是二进制文件，无法直接查看，可以通过`mysqlbinlog`工具来查看。
+默认情况下 bin log 是二进制文件，无法直接查看，可以通过`mysqlbinlog`工具来查看。
 
-bin_log的文件大小可能会大于`max_binlog_size`，因为一个事务的二进制日志不会只会写入到一个文件中。
+bin_log 的文件大小可能会大于`max_binlog_size`，因为一个事务的二进制日志只会写入到一个文件中。
 
 记录二进制日志有两种方式：
 
 1. Row-based logging：描述独立的一行记录被修改的细节。
 
-   缺点：由于所有的执行的语句在日志中都将以每行记录的修改细节来记录，因此，可能会产生大量的日志内容，干扰内容也较多；比如一条update语句，如修改多条记录，则bin log中每一条修改都会有记录，这样造成bin log日志量会很大，特别是当执行alter table之类的语句的时候，由于表结构修改，每条记录都发生改变，那么该表每一条记录都会记录到日志中，实际等于重建了表。
+   缺点：由于所有的执行的语句在日志中都将以每行记录的修改细节来记录，因此，可能会产生大量的日志内容，干扰内容也较多；比如一条 update 语句，如修改多条记录，则 bin log 中每一条修改都会有记录，这样造成 bin log 日志量会很大，特别是当执行 alter table 之类的语句的时候，由于表结构修改，每条记录都发生改变，那么该表每一条记录都会记录到日志中，实际等于重建了表。
 
-   使用这种方式记录日志时，Worker节点根据bin log执行的SQL语句不会写入到general log
+   使用这种方式记录日志时，Worker 节点根据 bin log 执行的 SQL 语句不会写入到 general log
 
 2. Statement-based logging：记录导致数据改变的SQL语句。
 
-   缺点：为了保证SQL语句能在worker节点上正确执行，必须记录上下文信息，以保证所有语句能在worker得到和在master端执行时相同的结果；另外，主从复制时，存在部分函数（如sleep）及存储过程在worker上会出现与master结果不一致的情况，而相比Row level记录每一行的变化细节，绝不会发生这种不一致的情况
+   缺点：为了保证SQL语句能在 worker 节点上正确执行，必须记录上下文信息，以保证所有语句能在 worker 得到和在 master 端执行时相同的结果；另外，主从复制时，存在部分函数（如 sleep）及存储过程在 worker 上会出现与 master 结果不一致的情况，而相比 Row level 记录每一行的变化细节，绝不会发生这种不一致的情况
    
-   使用该方式时，Worker节点收到的bin log中的SQL语句会写入到其general log中。
+   使用该方式时，Worker 节点收到的 bin log 中的SQL语句会写入到其 general log 中。
+
+如果想开启基于行的复制，需要在 MySQL 配置中加入以下配置：
+
+```
+binlog-format=ROW
+```
+
+默认参数是 STATEMENT，基于语句的复制：
+
+```
+binlog-format=STATEMENT
+```
+
+官方推荐混合模式（正常情况下使用基于 statement 的复制，对不安全的语句则切换到基于行的复制），通过以下配置来打开：
+
+```
+binlog-format=MIXED
+```
+
+
 
 **基于Bin Log的主从复制过程：**
 
@@ -388,6 +408,58 @@ c.Master接收到来自Worker的IO进程的请求后，负责复制的IO进程�
   返回信息中除了日志所包含的信息之外，还包括本次传输中，Master端传输的最后的bin-log文件的名称以及bin-log的位置。
 d.Worker的IO进程接收到信息后，将接收到的日志内容依次添加到Worker端的relay-log文件的最末端，并将读取到的Master端的bin-log的文   件名和位置记录到master-info文件中，以便在下一次读取的时候能够告诉Master需要读取从某个bin-log的哪个位置开始往后的日志内容。
 e.Worker的Sql进程检测到relay-log中新增加了内容后，会马上解析relay-log的内容成为在Master端真实执行时候的那些可执行的内容，并在自身执行。
+```
+
+#### Bin log 日志结构
+
+binlog 包含若干二进制文件，另外还包含一个索引文件，这个索引记录了所有的二进制文件。
+
+每个 binlog 文件包含若干个事件，每个文件都是以 Format_description 开始和 Rotate 事件结尾。注意，如果服务器突然宕机，binlog 文件结尾就不会是 Rotate 事件。
+
+Format_description 事件包含了服务器信息，以及关于文件状态的关键信息。在服务器重启后，会在一个新的文件内写入一个新的 Format_description 事件，因为服务器重启后，服务器配置可能更新。
+
+写完 binlog 文件后，会在文件末尾添加一个 Rotate 事件，该事件记录了下一个 binlog 文件，并且记录了文件的起始位置。
+
+除了这俩控制事件，其他事件都被分成组，每个组大致对应一个事务，对于非事务引擎来说，一个组就是一个语句。
+
+一个组要么全执行，要么全不执行。
+
+#### Bin log 事件结构
+
+每个事件由以下部分组成：
+
+- **Common header** 包含基本信息，最重要的是事件类型和事件大小
+- **Post header** 提交头与特定的事件类型有关。
+- **Event body** 事件体，储存事件的主要数据。
+- **Checksum** 校验和，是一个 32 位整数，用于检查事件写入后是否有损坏，5.6 版本加入。
+
+其中 ，Common header 与 Post header 的大小是固定的，大小记录在 Format_description 事件之中。
+
+Format_description 包含的信息如下：
+
+- 服务器版本
+- binlog 文件格式版本
+- 通用头长度
+- 提交头长度
+
+#### 清除 Bin Log 文件
+
+通过设置下面的参数可以让服务器自动清除旧的 binlog 文件：
+
+```shell
+expire-logs-days=3
+```
+
+若要手工删除，可以使用以下命令：
+
+```shell
+mysql> PURGE BINARY LOGS BEFORE '2020-06-29 00:00:00';
+```
+
+或者：
+
+```shell
+mysql> PURGE BINARY LOGS TO 'master-bin.000002';
 ```
 
 
@@ -1067,6 +1139,10 @@ INNODB_LOCK_WAITS 表反应事务的等待：
 ## 一致性非锁定读
 
 一致性的非锁定读（consistent nonlocking read）是指 `InnoDB`存储引擎通过行多版本控制的方法来读取当前执行时间数据库中行的数据，如果读取的行正在执行 DELETE 或 UPDATE 操作，这时读取操作不会因此去等待行上锁的释放。相反地，`InnoDB` 存储引擎会去读取行的快照数据。
+
+快照数据是指该行的之前版本的数据，该实现是通过 undo 段来完成。而 undo 用来在事务中回滚数据，因此快照数据本身没有额外的开销。此外，读取快照数据不需要加锁，因为没有事务需要对历史的数据进行修改操作。
+
+一行记录可能有多个版本，一般称这种技术为行多版本技术，由此带来的并发控制，称为多版本并发控制（MVCC）。
 
 
 
