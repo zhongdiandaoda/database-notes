@@ -1025,7 +1025,9 @@ B+树索引本身不能找到具体的一条记录，只能找到数据所在的
 
 **异常结果：**商品S库存更新为120，但实际上针对商品S进行了两次入库操作，最终商品S库存应为100+10+20=130，但实际结果为120，首先提交的事务A的更新『丢失了』！！！所以就需要锁机制来保证这种情况不会发生。
 
-## 锁的类型
+## `InnoDB`中的锁
+
+### 锁的类型
 
 按照锁的粒度，可以划分为：行锁、页锁、表锁
 
@@ -1035,7 +1037,7 @@ B+树索引本身不能找到具体的一条记录，只能找到数据所在的
 
 
 
-## 共享锁与排他锁
+### 共享锁与排他锁
 
 `InnoDB`实现了两种标准行级锁，一种是共享锁(shared locks，S锁)，一种是排它锁(exclusive locks，X锁)。
 
@@ -1051,7 +1053,7 @@ X锁：如果事务T1持有了行r上的X锁，则其他任何事务不能持有
 
 - T2如果想在行r上获取X锁，必须等待其他事务对该行添加的S锁或X锁的释放。
 
-## 意向锁
+### 意向锁
 
 `InnoDB`支持多种粒度的锁，允许行级锁和表级锁的共存。例如 LOCK TABLES ... WRITE 等语句可以在指定的表上加上独占锁。`InnoDB`使用意向锁来实现多个粒度级别的锁定。意向锁是表级锁，表示 table 中的 row 所需要的锁( S 锁或 X 锁)的类型。
 
@@ -1136,13 +1138,185 @@ INNODB_LOCK_WAITS 表反应事务的等待：
 | `blocking_trx_id`    | 被阻塞的事务ID         |
 | `blocking_lock_id`   | 被阻塞的事务申请的锁ID |
 
-## 一致性非锁定读
+### 一致性非锁定读
 
 一致性的非锁定读（consistent nonlocking read）是指 `InnoDB`存储引擎通过行多版本控制的方法来读取当前执行时间数据库中行的数据，如果读取的行正在执行 DELETE 或 UPDATE 操作，这时读取操作不会因此去等待行上锁的释放。相反地，`InnoDB` 存储引擎会去读取行的快照数据。
 
 快照数据是指该行的之前版本的数据，该实现是通过 undo 段来完成。而 undo 用来在事务中回滚数据，因此快照数据本身没有额外的开销。此外，读取快照数据不需要加锁，因为没有事务需要对历史的数据进行修改操作。
 
 一行记录可能有多个版本，一般称这种技术为行多版本技术，由此带来的并发控制，称为多版本并发控制（MVCC）。
+
+在事务隔离级别 READ COMMITED 和 REPEATABLE READ（`InnoDB`存储引擎的默认事务隔离级别）下，`InnoDB`存储引擎使用非锁定的一致性读。然而，在 READ COMMITED 事务隔离级别下，非一致性读总是读取被锁定行的最新一份快照数据（其他事务在该事务期间执行 COMMIT 后，将导致不可重复读问题）。而在 REPEATABLE READ 事务隔离级别下，对于快照数据，非一致性读总是读取事务开始时的行数据版本（其他事务在该事务执行期间做出的提交，不会导致该事务执行期间相同的 SQL 语句得到不同的结果）。
+
+demo：
+
+```mysql
+# Session A
+mysql> BEGIN
+Query OK, 0 rows affected (0.00 sec)
+mysql> SELECT * FROM parent WHERE id = 1;
++----+
+| id |
++----+
+|  1 |
++----+
+1 row in set (0.00 sec)
+
+# Session B
+mysql> BEGIN
+Query OK, 0 rows affected (0.00 sec)
+mysql> UPDATE parent SET id = 3 WHERE id = 1;
+Query OK, 1 row affected (0.00 sec)
+Rows matched: 1 Changed: 1 Warnings: 0
+```
+
+在会话 B 中修改 id 为 3，但是没有 COMMIT，这时相当于给 id = 1 的行加了一个 X 锁。如果这时在 A 中再次读取 id 为 1 的记录，当隔离级别为 READ COMMITED 和 REPEATABLE READ 时，数据库事务引擎会利用非锁定一致性读的特性读取数据：
+
+```mysql
+mysql> SELECT * FROM parent WHERE id = 1;
++----+
+| id |
++----+
+|  1 |
++----+
+1 row in set (0.00 sec)
+```
+
+在会话 B 中执行 COMMIT 后：
+
+```sql
+# Session B
+mysql> COMMIT;
+Query OK, 0 rows affected (0.00 sec)
+
+# Session A
+# READ-COMMITED 事务隔离级别下
+mysql> SELECT * FROM parent WHERE id = 1;
+Empty set (0.00 sec)
+
+# Session A
+# REPEATABLE READ 事务隔离级别下
+mysql> SELECT * FROM parent WHERE id = 1;
++----+
+| id |
++----+
+|  1 |
++----+
+1 row in set (0.00 sec)
+```
+
+> 对于 READ COMMITED 事务隔离级别而言，其违反了 ACID 特性的 I 特性，即同一时间只允许一个事务访问某一数据。
+
+### 一致性锁定读
+
+在默认的 REPEATABLE READ 隔离级别下，对于 SELECT 语句，`InnoDB`存储引擎对 SELECT 操作会使用一致性非锁定读，但是在某些情况下，用户需要显式地对数据库的读取操作加锁来保证数据逻辑的一致性。
+
+`InnoDB`对于 SELECT 语句支持两种一致性的锁定读操作：
+
+- `SELECT … FOR UPDATE`：对读取的行记录加一个 X 锁，其他事务不能对已锁定的行加上任何锁。
+- `SELECT … LOCK IN SHARE MODE`：对读取的行记录加一个 S 锁，其他事务可以向被锁定的行加 S 锁，不能加 X 锁。
+
+这两种语句必须在一个事务中，当事务提交后，锁就释放了。
+
+即使加锁后，一致性非锁定读也可以进行读取。
+
+### 自增长与锁
+
+自增主键是数据库中的一个常见属性。
+
+得到计数器的值：`SELECT MAX(auto_inc_row) FROM t FOR UPDATE;`
+
+插入操作会根据该语句的值加 1 赋值到自增列。这种锁采用了特殊的表锁机制（AUTO-INC-LOCKING），为了提高性能，锁不是在事务完成之后才释放，而是在完成对自增长值插入的 SQL 语句后立即释放。
+
+## 锁的算法
+
+### 行锁的 3 种算法
+
+`InnoDB`存储引擎有三种行锁算法：
+
+- `Record Lock`：单个行记录上的锁
+- `Gap Lock`：间隙锁，锁定一个范围，但不包括记录本身
+- `Next-Key Lock`：``Gap Lock + Record Lock`，锁定范围+记录
+
+`InnoDB`所有的行锁算法都是基于索引实现的，锁定的也都是索引或索引区间。
+
+`Gap Lock`的作用是为了阻止多个事务将记录插入到同一个范围内，因为这会导致幻读问题（phantom Problem）的产生，用户可以通过以下两种方式来显式地关闭`Gap Lock`：
+
+- 将事务的隔离级别设置为`READ COMMITTED`
+- 将参数 `innodb_locks_unsafe_for_binlog` 设置为 1
+
+
+
+`Next-Key Lock` 是结合了 `Gap Lock` 和 `Record Lock` 的一种索引算法，这种锁定技术，不止锁定记录本身，还锁定一个范围。
+
+例如一个索引有 10, 11, 13, 20 这四个值。`InnoDB`可以根据需要使用`Record Lock`将 10，11，13，20 四个索引锁住，也可以使用`Gap Lock`将``(-∞,10)，(10,11)，(11,13)，(13,20)，(20, +∞)``五个范围区间锁住。Next-Key Locking类似于上述两种锁的结合，它可以锁住的区间有为``(-∞,10]，(10,11]，(11,13]，(13,20]，(20, +∞)``，可以看出它即锁定了一个范围，也会锁定记录本身。
+
+
+
+锁算法的一些规则：
+
+- 在不通过索引条件查询时，`InnoDB` 会锁定表中的所有记录。所以，如果考虑性能，WHERE语句中的条件查询的字段都应该加上索引。
+
+- `InnoDB`通过索引来实现行锁，而不是通过锁住记录。因此，当操作的两条不同记录拥有相同的索引时，也会因为行锁被锁而发生等待。
+
+- 由于`InnoDB`的索引机制，数据库操作使用了主键索引，`InnoDB`会锁住主键索引；使用非主键索引时，`InnoDB`会先锁住非主键索引，再锁定主键索引。
+
+- 当查询的索引是唯一索引(不存在两个数据行具有完全相同的键值)时，`InnoDB`存储引擎会将`Next-Key Lock`降级为`Record Lock`，即只锁住索引本身，而不是范围。
+
+- `InnoDB`对于辅助索引有特殊的处理，不仅会锁住辅助索引值所在的范围，还会将其下一键值加上`Gap LOCK`。
+
+- `InnoDB`使用`Next-Key Lock`机制来避免Phantom Problem（幻读问题）。
+
+
+
+`InnoDB` 对于行的查询默认是采用 `Next-Key Lock` 算法（REPEATABLE READ级别下），当查询的索引含有唯一属性时（主键索引、唯一索引），`InnoDB` 存储引擎会对 `Next-Key Lock` 进行优化，将其降级为 `Record Lock`；而对于辅助索引，不仅会对索引列加 `Record Lock` ，还会对索引列前后的键值范围加上 `Gap Lock`。
+
+```sql
+CREATE TABLE e4 (a INT, b INT, PRIMARY KEY(a), KEY(b));
+INSERT INTO e4 SELECT 1,1;
+INSERT INTO e4 SELECT 3,1;
+INSERT INTO e4 SELECT 5,3;
+INSERT INTO e4 SELECT 7,6;
+INSERT INTO e4 SELECT 10,8;
+```
+
+ 然后开启一个会话执行下面的语句。
+
+```sql
+SELECT * FROM e4 WHERE b=3 FOR UPDATE; 
+```
+
+因为通过索引b来进行查询，所以`InnoDB`会使用`Next-Key Lock`进行加锁，并且索引 b 是非主键索引，所以还会对主键索引 a 进行加锁。对于主键索引 a，仅仅对值为 5 的索引加上 Record Lock（因为之前的规则）。而对于索引 b，需要加上`Next-Key Lock`索引，锁定的范围是 (1,3]。除此之外，还会对其下一个键值加上`Gap Lock`，即还有一个范围为`(3,6)`的锁。 再新开一个会话，执行下面的SQL语句，会发现都会被阻塞。
+
+```sql
+SELECT * FROM e4 WHERE a = 5 FOR UPDATE;  # 主键a被锁
+INSERT INTO e4 SELECT 4,2;   # 插入行b的值为2，在锁定的(1,3]范围内
+INSERT INTO e4 SELECT 6,5; # 插入行b的值为5，在锁定的(3,6)范围内
+```
+
+> 在 READ COMMITED 隔离级别下，仅使用 Record Lock，但是这破坏了事务的隔离性，还可能导致主从数据库的不一致。从性能上看，READ COMMITED 也不会优于默认的REPEATABLE READ。
+
+### 幻读问题
+
+在 REPEATABLE READ 隔离级别下，可能会出现幻读的问题。`InnoDB`采用了 Next-Key Locking 机制来避免幻读问题，这点不同于其他数据库，如 Oracle 数据库可能需要在 Serializable 级别下才能解决幻读。
+
+ 幻读是指同一事务执行两次相同的 SQL 语句，产生不同的结果。如，第一次执行范围查询后，另一个事务在该范围插入了数据，则第二次范围查询的结果将不同。
+
+## 锁的问题
+
+### 脏读
+
+脏数据是指未提交的数据，脏读是指一个事务中读到了另一个事务中未提交的数据。
+
+将数据库隔离级别设置为 READ UNCOMMITED 时，会发生脏读。
+
+### 不可重复读
+
+不可重复读是指在一直事务中多次读取同一数据集合，在这个事务还没有结束时，另外一个事务也访问同一数据集合，并做了 DML 操作然后 commit。在第一个事务的两次读数据之间，由于第二个事务的操作，可能读到不同的数据，这种情况称为不可重复读。
+
+脏读是指读到了未提交的数据，而不可重复读是读到了已提交的数据。
+
+### 阻塞
 
 
 
